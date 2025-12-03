@@ -1,8 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { sonarr, auth } from '../services/api';
+import { sonarr, auth, operations as operationsApi } from '../services/api';
 import ActivityHistory from './ActivityHistory';
 import SonarrSelector from './SonarrSelector';
+import EnhancedProgressBar from './EnhancedProgressBar';
+import useWebSocket from '../hooks/useWebSocket';
 import logoTransparent from '../assets/logotransparent.png';
 
 export default function Activity() {
@@ -10,10 +12,24 @@ export default function Activity() {
   const [instances, setInstances] = useState([]);
   const [selectedInstance, setSelectedInstance] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [user, setUser] = useState(null);
+  const [operations, setOperations] = useState([]);
+  const [activeSingleOperations, setActiveSingleOperations] = useState(new Map());
+  const { addMessageHandler } = useWebSocket(user?.id);
 
   useEffect(() => {
     loadInstances();
+    loadUser();
   }, []);
+
+  const loadUser = async () => {
+    try {
+      const response = await auth.getMe();
+      setUser(response.data);
+    } catch (error) {
+      console.error('Error loading user:', error);
+    }
+  };
 
   const loadInstances = async () => {
     setLoading(true);
@@ -33,6 +49,150 @@ export default function Activity() {
   const handleInstanceChange = (instance) => {
     setSelectedInstance(instance);
   };
+
+  useEffect(() => {
+    let intervalId;
+    const loadOperations = async () => {
+      try {
+        const response = await operationsApi.getUserOperations();
+        setOperations(response.data.operations || []);
+      } catch (error) {
+        console.error('Error loading operations:', error);
+      }
+    };
+
+    loadOperations();
+    intervalId = setInterval(loadOperations, 5000);
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, []);
+
+  // Track single Season It operations via WebSocket
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const cleanupHandlers = [];
+
+    // Track enhanced progress updates (single Season It operations)
+    cleanupHandlers.push(
+      addMessageHandler('enhanced_progress_update', (data) => {
+        if (data.show_title) {
+          setActiveSingleOperations(prev => {
+            const newMap = new Map(prev);
+            if (data.status === 'success' || data.status === 'error' || data.status === 'warning') {
+              // Remove after completion (with delay to show final state)
+              setTimeout(() => {
+                setActiveSingleOperations(prevMap => {
+                  const updated = new Map(prevMap);
+                  updated.delete(data.show_title);
+                  return updated;
+                });
+              }, 2000);
+            } else {
+              // Update active operation
+              newMap.set(data.show_title, {
+                name: data.show_title,
+                progress: data.progress,
+                status: data.status,
+                message: data.message,
+                operation_type: data.operation_type,
+                timestamp: data.timestamp
+              });
+            }
+            return newMap;
+          });
+        }
+      })
+    );
+
+    // Track bulk operations
+    cleanupHandlers.push(
+      addMessageHandler('bulk_operation_update', (data) => {
+        // Bulk operations are already tracked via operations API
+        // This is just to ensure we have the latest progress
+      })
+    );
+
+    return () => {
+      cleanupHandlers.forEach(cleanup => cleanup());
+    };
+  }, [user?.id, addMessageHandler]);
+
+  const { queuedShows, activeShows, completedShows } = useMemo(() => {
+    const queued = [];
+    const active = [];
+    const completed = [];
+
+    // Process bulk operations
+    operations
+      .filter(op => op.operation_type === 'season_it_bulk')
+      .forEach(op => {
+        const completedIds = new Set((op.completed_items || []).map(i => i.id));
+        const failedIds = new Set((op.failed_items || []).map(i => i.id));
+        const items = op.items || [];
+
+        items.forEach((item, index) => {
+          const isCompleted = completedIds.has(item.id) || failedIds.has(item.id);
+          const isCurrent =
+            op.status === 'running' &&
+            op.current_item === index + 1 &&
+            !isCompleted;
+          
+          // Only categorize items as 'queued' if the operation is still active
+          // (pending or running). If the operation is finished (cancelled, failed,
+          // or completed), unprocessed items should be marked as completed since
+          // they won't be processed.
+          const isOperationActive = op.status === 'pending' || op.status === 'running';
+          const status = isCompleted 
+            ? 'completed' 
+            : isCurrent 
+              ? 'active' 
+              : isOperationActive 
+                ? 'queued' 
+                : 'completed'; // Operation finished, so unprocessed items are effectively done
+
+          const entry = {
+            id: item.id,
+            name: item.name || `Item ${index + 1}`,
+            status: status,
+            operation_status: op.status,
+            operation_id: op.operation_id,
+            // Prefer per-item progress for the active row; fall back to overall.
+            progress: isCurrent
+              ? (op.current_item_progress ?? op.overall_progress ?? 0)
+              : op.overall_progress ?? 0,
+          };
+
+          if (entry.status === 'queued') {
+            queued.push(entry);
+          } else if (entry.status === 'active') {
+            active.push(entry);
+          } else {
+            completed.push(entry);
+          }
+        });
+      });
+
+    // Add single Season It operations from WebSocket
+    activeSingleOperations.forEach((op, showTitle) => {
+      // Only add if not already in active from bulk operations
+      const alreadyInActive = active.some(a => a.name === showTitle);
+      if (!alreadyInActive) {
+        active.push({
+          id: `single-${showTitle}`,
+          name: op.name,
+          status: 'active',
+          operation_status: 'running',
+          progress: op.progress || 0,
+          operation_id: `single-${showTitle}-${op.timestamp || Date.now()}`,
+        });
+      }
+    });
+
+    return { queuedShows: queued, activeShows: active, completedShows: completed };
+  }, [operations, activeSingleOperations]);
 
   return (
     <div className="dashboard">
@@ -71,6 +231,58 @@ export default function Activity() {
 
         <div className="activity-page">
           <h2>Activity History</h2>
+          {user && <EnhancedProgressBar userId={user.id} />}
+          
+          <div className="activity-queue-sections">
+            <div className="activity-queue-column">
+              <h3>In Queue</h3>
+              {queuedShows.length === 0 ? (
+                <p className="activity-queue-empty">No shows waiting in the queue.</p>
+              ) : (
+                <ul className="activity-queue-list">
+                  {queuedShows.map(show => (
+                    <li key={`queued-${show.operation_id || 'single'}-${show.id}`}>
+                      {show.name}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="activity-queue-column">
+              <h3>Active</h3>
+              {activeShows.length === 0 ? (
+                <p className="activity-queue-empty">No active Season It operations.</p>
+              ) : (
+                <ul className="activity-queue-list">
+                  {activeShows.map(show => (
+                    <li key={`active-${show.operation_id || 'single'}-${show.id}`}>
+                      <span className="activity-queue-name">{show.name}</span>
+                      <span className="activity-queue-progress">
+                        {Math.round(show.progress)}%
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div className="activity-queue-column">
+              <h3>Completed (recent)</h3>
+              {completedShows.length === 0 ? (
+                <p className="activity-queue-empty">No recently completed shows.</p>
+              ) : (
+                <ul className="activity-queue-list">
+                  {completedShows.slice(0, 10).map(show => (
+                    <li key={`completed-${show.operation_id || 'single'}-${show.id}`}>
+                      {show.name}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+
           {loading ? (
             <div className="loading">Loading instances...</div>
           ) : (

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from typing import Optional, Dict, Any, List
 from sqlalchemy.orm import Session
 from models import SonarrInstance, UserSettings, ActivityLog
@@ -9,6 +10,13 @@ from bulk_operation_manager import bulk_operation_manager
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Global semaphore to limit concurrent Season It style operations hitting Sonarr.
+# This effectively creates a simple in-memory queue so we don't overload Sonarr
+# when many Season It jobs are triggered at once. Default is 1 = strictly
+# process one show at a time, but can be tuned via SEASON_IT_MAX_CONCURRENT.
+_max_concurrent_season_it = int(os.getenv("SEASON_IT_MAX_CONCURRENT", "1"))
+SEASON_IT_SEMAPHORE = asyncio.Semaphore(_max_concurrent_season_it)
 
 class SeasonItService:
     def __init__(self, db: Session, user_id: int):
@@ -45,66 +53,70 @@ class SeasonItService:
 
     async def process_season_it(self, show_id: int, season_number: Optional[int] = None, instance_id: Optional[int] = None) -> Dict[str, Any]:
         activity = None
-        try:
-            # Get series data first so we can include poster info
-            instance = self._get_sonarr_instance_by_id(instance_id) if instance_id else self._get_sonarr_instance(show_id)
-            if not instance:
-                raise Exception("No Sonarr instance found for this show")
+        # Use the global semaphore so that only a small number of Season It
+        # operations can run against Sonarr at once. Additional requests will
+        # wait here, effectively forming a queue.
+        async with SEASON_IT_SEMAPHORE:
+            try:
+                # Get series data first so we can include poster info
+                instance = self._get_sonarr_instance_by_id(instance_id) if instance_id else self._get_sonarr_instance(show_id)
+                if not instance:
+                    raise Exception("No Sonarr instance found for this show")
 
-            client = SonarrClient(instance.url, instance.api_key, instance.id)
-            series_data = await self._get_series_data(client, show_id)
-            show_title = series_data.get("title", "Unknown Show")
-            poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
+                client = SonarrClient(instance.url, instance.api_key, instance.id)
+                series_data = await self._get_series_data(client, show_id)
+                show_title = series_data.get("title", "Unknown Show")
+                poster_url = client._get_banner_url(series_data.get("images", []), client.instance_id)
 
-            # Send enhanced progress update instead of regular one
-            await manager.send_enhanced_progress_update(
-                self.user_id, 
-                show_title,
-                "season_it_single" if season_number else "season_it_all",
-                "🚀 Initializing Season It process...", 
-                10,
-                current_step="Initialize",
-                details={"poster_url": poster_url, "season_number": season_number}
-            )
+                # Send enhanced progress update instead of regular one
+                await manager.send_enhanced_progress_update(
+                    self.user_id, 
+                    show_title,
+                    "season_it_single" if season_number else "season_it_all",
+                    "🚀 Initializing Season It process...", 
+                    10,
+                    current_step="Initialize",
+                    details={"poster_url": poster_url, "season_number": season_number}
+                )
 
-            # Create activity log entry
-            activity = self._create_activity_log(instance.id, show_id, show_title, season_number)
+                # Create activity log entry
+                activity = self._create_activity_log(instance.id, show_id, show_title, season_number)
 
-            if season_number:
-                result = await self._process_single_season_with_data(client, show_id, season_number, show_title, series_data)
-            else:
-                result = await self._process_all_seasons(client, show_id, show_title, series_data)
+                if season_number:
+                    result = await self._process_single_season_with_data(client, show_id, season_number, show_title, series_data)
+                else:
+                    result = await self._process_all_seasons(client, show_id, show_title, series_data)
 
-            # Update activity log on success
-            self._update_activity_log(
-                activity, 
-                "success", 
-                f"Season It completed successfully for {show_title}" + (f" Season {season_number}" if season_number else " (All Seasons)")
-            )
-            
-            return result
-
-        except Exception as e:
-            # Update activity log on error
-            if activity:
+                # Update activity log on success
                 self._update_activity_log(
                     activity, 
-                    "error", 
-                    f"Season It failed for {activity.show_title}",
-                    str(e)
+                    "success", 
+                    f"Season It completed successfully for {show_title}" + (f" Season {season_number}" if season_number else " (All Seasons)")
                 )
-            
-            await manager.send_enhanced_progress_update(
-                self.user_id, 
-                activity.show_title if activity else "Unknown Show",
-                "season_it_error",
-                f"❌ Season It failed: {str(e)}", 
-                100, 
-                "error",
-                current_step="Error",
-                details={"error": str(e)}
-            )
-            raise
+                
+                return result
+
+            except Exception as e:
+                # Update activity log on error
+                if activity:
+                    self._update_activity_log(
+                        activity, 
+                        "error", 
+                        f"Season It failed for {activity.show_title}",
+                        str(e)
+                    )
+                
+                await manager.send_enhanced_progress_update(
+                    self.user_id, 
+                    activity.show_title if activity else "Unknown Show",
+                    "season_it_error",
+                    f"❌ Season It failed: {str(e)}", 
+                    100, 
+                    "error",
+                    current_step="Error",
+                    details={"error": str(e)}
+                )
+                raise
 
     async def _process_single_season_with_data(self, client: SonarrClient, show_id: int, season_number: int, show_title: str, series_data: Dict) -> Dict[str, Any]:
         """Enhanced single season processing with detailed progress tracking (15+ steps)"""
@@ -726,8 +738,11 @@ class SeasonItService:
             operation_func=self._process_bulk_item,
             description=f"Season It bulk operation for {len(show_items)} shows"
         )
-        
-        return await bulk_operation_manager.execute_operation(operation_id)
+
+        # Ensure bulk Season It operations also respect the global concurrency
+        # limit so we don't run multiple heavy bulk jobs at the same time.
+        async with SEASON_IT_SEMAPHORE:
+            return await bulk_operation_manager.execute_operation(operation_id)
     
     async def _process_bulk_item(self, item: Dict, progress_callback: callable) -> Dict[str, Any]:
         """Process a single item in bulk operation"""

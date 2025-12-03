@@ -115,4 +115,8 @@ export const settings = {
   purgeDatabase: () => api.delete('/purge-database'),
 };
 
+export const operations = {
+  getUserOperations: () => api.get('/operations'),
+};
+
 export default api;

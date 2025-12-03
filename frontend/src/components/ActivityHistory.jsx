@@ -1,11 +1,65 @@
 import { useState, useEffect } from 'react';
-import { sonarr } from '../services/api';
+import { sonarr, auth } from '../services/api';
+import useWebSocket from '../hooks/useWebSocket';
 
 export default function ActivityHistory({ selectedInstance }) {
   const [activities, setActivities] = useState([]);
   const [loading, setLoading] = useState(false);
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
+  const [progressMap, setProgressMap] = useState(new Map());
+  const [user, setUser] = useState(null);
+  const { addMessageHandler } = useWebSocket(user?.id);
+
+  useEffect(() => {
+    const loadUser = async () => {
+      try {
+        const response = await auth.getMe();
+        setUser(response.data);
+      } catch (error) {
+        console.error('Error loading user:', error);
+      }
+    };
+    loadUser();
+  }, []);
+
+  // Track progress updates via WebSocket for IN_PROGRESS activities
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const cleanupHandlers = [];
+
+    cleanupHandlers.push(
+      addMessageHandler('enhanced_progress_update', (data) => {
+        if (data.show_title) {
+          setProgressMap(prev => {
+            const newMap = new Map(prev);
+            if (data.status === 'success' || data.status === 'error' || data.status === 'warning') {
+              // Remove after completion
+              setTimeout(() => {
+                setProgressMap(prevMap => {
+                  const updated = new Map(prevMap);
+                  updated.delete(data.show_title);
+                  return updated;
+                });
+              }, 2000);
+            } else {
+              newMap.set(data.show_title, {
+                progress: data.progress,
+                message: data.message,
+                status: data.status
+              });
+            }
+            return newMap;
+          });
+        }
+      })
+    );
+
+    return () => {
+      cleanupHandlers.forEach(cleanup => cleanup());
+    };
+  }, [user?.id, addMessageHandler]);
 
   useEffect(() => {
     if (selectedInstance) {
@@ -122,6 +176,22 @@ export default function ActivityHistory({ selectedInstance }) {
                 
                 <div className="activity-message-section">
                   <p className="activity-message-text">{activity.message}</p>
+                  {activity.status === 'in_progress' && progressMap.has(activity.show_title) && (
+                    <div className="activity-progress-indicator">
+                      <div className="activity-progress-bar-container">
+                        <div 
+                          className="activity-progress-bar-fill"
+                          style={{ 
+                            width: `${progressMap.get(activity.show_title).progress}%`,
+                            backgroundColor: '#ff9800'
+                          }}
+                        />
+                      </div>
+                      <span className="activity-progress-text">
+                        {Math.round(progressMap.get(activity.show_title).progress)}%
+                      </span>
+                    </div>
+                  )}
                 </div>
                 
                 <div className="activity-footer">
