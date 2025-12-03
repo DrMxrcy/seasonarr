@@ -34,9 +34,34 @@ class BulkOperationManager:
     async def execute_operation(self, operation_id: str) -> Dict[str, Any]:
         """Execute a bulk operation"""
         if operation_id not in self.active_operations:
+            # Check if operation was cancelled while waiting (e.g., for semaphore)
+            # and moved to history
+            for op in self.operation_history:
+                if op['operation_id'] == operation_id:
+                    if op.get('cancelled') or op.get('status') == 'cancelled':
+                        # Operation was cancelled, return cancelled status
+                        logger.info(f"Operation {operation_id} was cancelled before execution")
+                        return {
+                            'operation_id': operation_id,
+                            'status': 'cancelled',
+                            'cancelled': True,
+                            'message': 'Operation was cancelled before execution'
+                        }
+            # Operation not found in active_operations or history
             raise ValueError(f"Operation {operation_id} not found")
         
         operation = self.active_operations[operation_id]
+        
+        # Check if operation was cancelled before we acquired the semaphore
+        if operation.cancelled:
+            logger.info(f"Operation {operation_id} was cancelled before execution")
+            self._move_to_history(operation)
+            return {
+                'operation_id': operation_id,
+                'status': 'cancelled',
+                'cancelled': True,
+                'message': 'Operation was cancelled before execution'
+            }
         
         try:
             result = await operation.execute()

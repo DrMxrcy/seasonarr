@@ -139,12 +139,26 @@ export default function Activity() {
             op.status === 'running' &&
             op.current_item === index + 1 &&
             !isCompleted;
+          
+          // Only categorize items as 'queued' if the operation is still active
+          // (pending or running). If the operation is finished (cancelled, failed,
+          // or completed), unprocessed items should be marked as completed since
+          // they won't be processed.
+          const isOperationActive = op.status === 'pending' || op.status === 'running';
+          const status = isCompleted 
+            ? 'completed' 
+            : isCurrent 
+              ? 'active' 
+              : isOperationActive 
+                ? 'queued' 
+                : 'completed'; // Operation finished, so unprocessed items are effectively done
 
           const entry = {
             id: item.id,
             name: item.name || `Item ${index + 1}`,
-            status: isCompleted ? 'completed' : isCurrent ? 'active' : 'queued',
+            status: status,
             operation_status: op.status,
+            operation_id: op.operation_id,
             // Prefer per-item progress for the active row; fall back to overall.
             progress: isCurrent
               ? (op.current_item_progress ?? op.overall_progress ?? 0)
@@ -172,6 +186,7 @@ export default function Activity() {
           status: 'active',
           operation_status: 'running',
           progress: op.progress || 0,
+          operation_id: `single-${showTitle}-${op.timestamp || Date.now()}`,
         });
       }
     });
@@ -226,7 +241,7 @@ export default function Activity() {
               ) : (
                 <ul className="activity-queue-list">
                   {queuedShows.map(show => (
-                    <li key={`queued-${show.operation_status}-${show.id}`}>
+                    <li key={`queued-${show.operation_id || 'single'}-${show.id}`}>
                       {show.name}
                     </li>
                   ))}
@@ -241,7 +256,7 @@ export default function Activity() {
               ) : (
                 <ul className="activity-queue-list">
                   {activeShows.map(show => (
-                    <li key={`active-${show.operation_status}-${show.id}`}>
+                    <li key={`active-${show.operation_id || 'single'}-${show.id}`}>
                       <span className="activity-queue-name">{show.name}</span>
                       <span className="activity-queue-progress">
                         {Math.round(show.progress)}%
@@ -259,7 +274,7 @@ export default function Activity() {
               ) : (
                 <ul className="activity-queue-list">
                   {completedShows.slice(0, 10).map(show => (
-                    <li key={`completed-${show.operation_status}-${show.id}`}>
+                    <li key={`completed-${show.operation_id || 'single'}-${show.id}`}>
                       {show.name}
                     </li>
                   ))}
