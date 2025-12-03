@@ -4,6 +4,7 @@ import { sonarr, auth, operations as operationsApi } from '../services/api';
 import ActivityHistory from './ActivityHistory';
 import SonarrSelector from './SonarrSelector';
 import EnhancedProgressBar from './EnhancedProgressBar';
+import useWebSocket from '../hooks/useWebSocket';
 import logoTransparent from '../assets/logotransparent.png';
 
 export default function Activity() {
@@ -13,6 +14,8 @@ export default function Activity() {
   const [loading, setLoading] = useState(false);
   const [user, setUser] = useState(null);
   const [operations, setOperations] = useState([]);
+  const [activeSingleOperations, setActiveSingleOperations] = useState(new Map());
+  const { addMessageHandler } = useWebSocket(user?.id);
 
   useEffect(() => {
     loadInstances();
@@ -66,11 +69,63 @@ export default function Activity() {
     };
   }, []);
 
+  // Track single Season It operations via WebSocket
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const cleanupHandlers = [];
+
+    // Track enhanced progress updates (single Season It operations)
+    cleanupHandlers.push(
+      addMessageHandler('enhanced_progress_update', (data) => {
+        if (data.show_title) {
+          setActiveSingleOperations(prev => {
+            const newMap = new Map(prev);
+            if (data.status === 'success' || data.status === 'error' || data.status === 'warning') {
+              // Remove after completion (with delay to show final state)
+              setTimeout(() => {
+                setActiveSingleOperations(prevMap => {
+                  const updated = new Map(prevMap);
+                  updated.delete(data.show_title);
+                  return updated;
+                });
+              }, 2000);
+            } else {
+              // Update active operation
+              newMap.set(data.show_title, {
+                name: data.show_title,
+                progress: data.progress,
+                status: data.status,
+                message: data.message,
+                operation_type: data.operation_type,
+                timestamp: data.timestamp
+              });
+            }
+            return newMap;
+          });
+        }
+      })
+    );
+
+    // Track bulk operations
+    cleanupHandlers.push(
+      addMessageHandler('bulk_operation_update', (data) => {
+        // Bulk operations are already tracked via operations API
+        // This is just to ensure we have the latest progress
+      })
+    );
+
+    return () => {
+      cleanupHandlers.forEach(cleanup => cleanup());
+    };
+  }, [user?.id, addMessageHandler]);
+
   const { queuedShows, activeShows, completedShows } = useMemo(() => {
     const queued = [];
     const active = [];
     const completed = [];
 
+    // Process bulk operations
     operations
       .filter(op => op.operation_type === 'season_it_bulk')
       .forEach(op => {
@@ -106,8 +161,23 @@ export default function Activity() {
         });
       });
 
+    // Add single Season It operations from WebSocket
+    activeSingleOperations.forEach((op, showTitle) => {
+      // Only add if not already in active from bulk operations
+      const alreadyInActive = active.some(a => a.name === showTitle);
+      if (!alreadyInActive) {
+        active.push({
+          id: `single-${showTitle}`,
+          name: op.name,
+          status: 'active',
+          operation_status: 'running',
+          progress: op.progress || 0,
+        });
+      }
+    });
+
     return { queuedShows: queued, activeShows: active, completedShows: completed };
-  }, [operations]);
+  }, [operations, activeSingleOperations]);
 
   return (
     <div className="dashboard">
