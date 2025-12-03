@@ -266,6 +266,7 @@ class BulkOperation:
             'current_item': self.current_item,
             'overall_progress': self.overall_progress,
             'current_item_progress': self.current_item_progress,
+            'items': self.items,
             'completed_items': self.completed_items,
             'failed_items': self.failed_items,
             'cancelled': self.cancelled,
