@@ -90,6 +90,10 @@ export default function Activity() {
             name: item.name || `Item ${index + 1}`,
             status: isCompleted ? 'completed' : isCurrent ? 'active' : 'queued',
             operation_status: op.status,
+            // Prefer per-item progress for the active row; fall back to overall.
+            progress: isCurrent
+              ? (op.current_item_progress ?? op.overall_progress ?? 0)
+              : op.overall_progress ?? 0,
           };
 
           if (entry.status === 'queued') {
@@ -168,7 +172,10 @@ export default function Activity() {
                 <ul className="activity-queue-list">
                   {activeShows.map(show => (
                     <li key={`active-${show.operation_status}-${show.id}`}>
-                      {show.name}
+                      <span className="activity-queue-name">{show.name}</span>
+                      <span className="activity-queue-progress">
+                        {Math.round(show.progress)}%
+                      </span>
                     </li>
                   ))}
                 </ul>
